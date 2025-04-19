@@ -1,0 +1,1886 @@
+diff --git a/Makefile b/Makefile
+index 62fd0f8..4b09918 100644
+--- a/Makefile
++++ b/Makefile
+@@ -139,6 +139,8 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_threads\
++	
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+diff --git a/kernel/defs.h b/kernel/defs.h
+index d1b6bb9..2636752 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -185,5 +185,27 @@ void            virtio_disk_init(void);
+ void            virtio_disk_rw(struct buf *, int);
+ void            virtio_disk_intr(void);
+ 
++
++
++//thread_function
++
++void            thread_freepagetable(pagetable_t, uint64);
++void            sleep_thread(uint64);
++void            wakeup_thread(uint64);
++int             thread_create_func(void(*fcn)(void*), void *arg, void *stack);
++int             thread_join_func(int thread_id);
++void            thread_exit_func(int);
++int             uvmmirror(pagetable_t, pagetable_t, uint64);
++int             uvmalloc_mirror(pagetable_t, pagetable_t, uint64, uint64);
++void            uvmfree_thread(pagetable_t, uint64);
++int             thread_mutex_lockrelease(pagetable_t, uint64);
++
++
++
++
++
++
++
++
+ // number of elements in fixed-size array
+ #define NELEM(x) (sizeof(x)/sizeof((x)[0]))
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 58a8a0b..b320fc3 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -14,6 +14,8 @@ struct proc *initproc;
+ 
+ int nextpid = 1;
+ struct spinlock pid_lock;
++//////////////////////////////////
++struct spinlock memlocks[NPROC];
+ 
+ extern void forkret(void);
+ static void freeproc(struct proc *p);
+@@ -29,40 +31,45 @@ struct spinlock wait_lock;
+ // Allocate a page for each process's kernel stack.
+ // Map it high in memory, followed by an invalid
+ // guard page.
+-void
+-proc_mapstacks(pagetable_t kpgtbl)
++void proc_mapstacks(pagetable_t kpgtbl)
+ {
+   struct proc *p;
+-  
+-  for(p = proc; p < &proc[NPROC]; p++) {
++
++  for (p = proc; p < &proc[NPROC]; p++)
++  {
+     char *pa = kalloc();
+-    if(pa == 0)
++    if (pa == 0)
+       panic("kalloc");
+-    uint64 va = KSTACK((int) (p - proc));
++    uint64 va = KSTACK((int)(p - proc));
+     kvmmap(kpgtbl, va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+   }
+ }
+ 
+ // initialize the proc table.
+-void
+-procinit(void)
++void procinit(void)
+ {
+   struct proc *p;
+-  
++
+   initlock(&pid_lock, "nextpid");
+   initlock(&wait_lock, "wait_lock");
+-  for(p = proc; p < &proc[NPROC]; p++) {
+-      initlock(&p->lock, "proc");
+-      p->state = UNUSED;
+-      p->kstack = KSTACK((int) (p - proc));
++  for (p = proc; p < &proc[NPROC]; p++)
++  {
++    initlock(&p->lock, "proc");
++    p->state = UNUSED;
++    p->kstack = KSTACK((int)(p - proc));
++  }
++
++  ///////////////memory_lock given//////////////////
++  for (int i = 0; i < NPROC; i++)
++  {
++    initlock(&memlocks[i], "memlock");
+   }
+ }
+ 
+ // Must be called with interrupts disabled,
+ // to prevent race with process being moved
+ // to a different CPU.
+-int
+-cpuid()
++int cpuid()
+ {
+   int id = r_tp();
+   return id;
+@@ -70,7 +77,7 @@ cpuid()
+ 
+ // Return this CPU's cpu struct.
+ // Interrupts must be disabled.
+-struct cpu*
++struct cpu *
+ mycpu(void)
+ {
+   int id = cpuid();
+@@ -79,7 +86,7 @@ mycpu(void)
+ }
+ 
+ // Return the current struct proc *, or zero if none.
+-struct proc*
++struct proc *
+ myproc(void)
+ {
+   push_off();
+@@ -89,11 +96,10 @@ myproc(void)
+   return p;
+ }
+ 
+-int
+-allocpid()
++int allocpid()
+ {
+   int pid;
+-  
++
+   acquire(&pid_lock);
+   pid = nextpid;
+   nextpid = nextpid + 1;
+@@ -106,16 +112,20 @@ allocpid()
+ // If found, initialize state required to run in the kernel,
+ // and return with p->lock held.
+ // If there are no free procs, or a memory allocation fails, return 0.
+-static struct proc*
++static struct proc *
+ allocproc(void)
+ {
+   struct proc *p;
+ 
+-  for(p = proc; p < &proc[NPROC]; p++) {
++  for (p = proc; p < &proc[NPROC]; p++)
++  {
+     acquire(&p->lock);
+-    if(p->state == UNUSED) {
++    if (p->state == UNUSED)
++    {
+       goto found;
+-    } else {
++    }
++    else
++    {
+       release(&p->lock);
+     }
+   }
+@@ -123,10 +133,15 @@ allocproc(void)
+ 
+ found:
+   p->pid = allocpid();
++
++  //////////////////memoryid assign////////////
++  p->mem_id = (uint64)(p - proc);
++
+   p->state = USED;
+ 
+   // Allocate a trapframe page.
+-  if((p->trapframe = (struct trapframe *)kalloc()) == 0){
++  if ((p->trapframe = (struct trapframe *)kalloc()) == 0)
++  {
+     freeproc(p);
+     release(&p->lock);
+     return 0;
+@@ -134,7 +149,8 @@ found:
+ 
+   // An empty user page table.
+   p->pagetable = proc_pagetable(p);
+-  if(p->pagetable == 0){
++  if (p->pagetable == 0)
++  {
+     freeproc(p);
+     release(&p->lock);
+     return 0;
+@@ -146,6 +162,10 @@ found:
+   p->context.ra = (uint64)forkret;
+   p->context.sp = p->kstack + PGSIZE;
+ 
++  //////////////////
++  p->is_thread = 0;
++  p->memlock = &memlocks[p->mem_id];
++
+   return p;
+ }
+ 
+@@ -155,12 +175,32 @@ found:
+ static void
+ freeproc(struct proc *p)
+ {
+-  if(p->trapframe)
+-    kfree((void*)p->trapframe);
++  if (p->trapframe)
++    kfree((void *)p->trapframe);
+   p->trapframe = 0;
+-  if(p->pagetable)
+-    proc_freepagetable(p->pagetable, p->sz);
++  // if (p->pagetable)
++  //   proc_freepagetable(p->pagetable, p->sz);
++  if (!p->is_thread)
++  {
++    if (p->pagetable)
++    {
++      acquire(p->memlock);
++      proc_freepagetable(p->pagetable, p->sz);
++      release(p->memlock);
++    }
++  }
++  else
++  { // free pagetable for thread
++    if (p->pagetable)
++    {
++      acquire(p->memlock);
++      thread_freepagetable(p->pagetable, p->sz);
++      release(p->memlock);
++    }
++  }
++  acquire(p->memlock);
+   p->pagetable = 0;
++  release(p->memlock);
+   p->sz = 0;
+   p->pid = 0;
+   p->parent = 0;
+@@ -169,6 +209,9 @@ freeproc(struct proc *p)
+   p->killed = 0;
+   p->xstate = 0;
+   p->state = UNUSED;
++  ///////////
++  p->is_thread = 0;
++  p->mem_id = -1;
+ }
+ 
+ // Create a user page table for a given process, with no user memory,
+@@ -180,23 +223,25 @@ proc_pagetable(struct proc *p)
+ 
+   // An empty page table.
+   pagetable = uvmcreate();
+-  if(pagetable == 0)
++  if (pagetable == 0)
+     return 0;
+ 
+   // map the trampoline code (for system call return)
+   // at the highest user virtual address.
+   // only the supervisor uses it, on the way
+   // to/from user space, so not PTE_U.
+-  if(mappages(pagetable, TRAMPOLINE, PGSIZE,
+-              (uint64)trampoline, PTE_R | PTE_X) < 0){
++  if (mappages(pagetable, TRAMPOLINE, PGSIZE,
++               (uint64)trampoline, PTE_R | PTE_X) < 0)
++  {
+     uvmfree(pagetable, 0);
+     return 0;
+   }
+ 
+   // map the trapframe page just below the trampoline page, for
+   // trampoline.S.
+-  if(mappages(pagetable, TRAPFRAME, PGSIZE,
+-              (uint64)(p->trapframe), PTE_R | PTE_W) < 0){
++  if (mappages(pagetable, TRAPFRAME, PGSIZE,
++               (uint64)(p->trapframe), PTE_R | PTE_W) < 0)
++  {
+     uvmunmap(pagetable, TRAMPOLINE, 1, 0);
+     uvmfree(pagetable, 0);
+     return 0;
+@@ -207,44 +252,49 @@ proc_pagetable(struct proc *p)
+ 
+ // Free a process's page table, and free the
+ // physical memory it refers to.
+-void
+-proc_freepagetable(pagetable_t pagetable, uint64 sz)
++void proc_freepagetable(pagetable_t pagetable, uint64 sz)
+ {
+   uvmunmap(pagetable, TRAMPOLINE, 1, 0);
+   uvmunmap(pagetable, TRAPFRAME, 1, 0);
+   uvmfree(pagetable, sz);
+ }
+ 
++void thread_freepagetable(pagetable_t pagetable, uint64 sz)
++{
++  uvmunmap(pagetable, TRAMPOLINE, 1, 0);
++  uvmunmap(pagetable, TRAPFRAME, 1, 0);
++  uvmfree_thread(pagetable, sz);
++}
+ // a user program that calls exec("/init")
+ // assembled from ../user/initcode.S
+ // od -t xC ../user/initcode
+ uchar initcode[] = {
+-  0x17, 0x05, 0x00, 0x00, 0x13, 0x05, 0x45, 0x02,
+-  0x97, 0x05, 0x00, 0x00, 0x93, 0x85, 0x35, 0x02,
+-  0x93, 0x08, 0x70, 0x00, 0x73, 0x00, 0x00, 0x00,
+-  0x93, 0x08, 0x20, 0x00, 0x73, 0x00, 0x00, 0x00,
+-  0xef, 0xf0, 0x9f, 0xff, 0x2f, 0x69, 0x6e, 0x69,
+-  0x74, 0x00, 0x00, 0x24, 0x00, 0x00, 0x00, 0x00,
+-  0x00, 0x00, 0x00, 0x00
+-};
++    0x17, 0x05, 0x00, 0x00, 0x13, 0x05, 0x45, 0x02,
++    0x97, 0x05, 0x00, 0x00, 0x93, 0x85, 0x35, 0x02,
++    0x93, 0x08, 0x70, 0x00, 0x73, 0x00, 0x00, 0x00,
++    0x93, 0x08, 0x20, 0x00, 0x73, 0x00, 0x00, 0x00,
++    0xef, 0xf0, 0x9f, 0xff, 0x2f, 0x69, 0x6e, 0x69,
++    0x74, 0x00, 0x00, 0x24, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00};
+ 
+ // Set up first user process.
+-void
+-userinit(void)
++void userinit(void)
+ {
+   struct proc *p;
+ 
+   p = allocproc();
+   initproc = p;
+-  
++
+   // allocate one user page and copy initcode's instructions
+   // and data into it.
++  acquire(p->memlock);
+   uvmfirst(p->pagetable, initcode, sizeof(initcode));
++  release(p->memlock);
+   p->sz = PGSIZE;
+ 
+   // prepare for the very first "return" from kernel to user.
+-  p->trapframe->epc = 0;      // user program counter
+-  p->trapframe->sp = PGSIZE;  // user stack pointer
++  p->trapframe->epc = 0;     // user program counter
++  p->trapframe->sp = PGSIZE; // user stack pointer
+ 
+   safestrcpy(p->name, "initcode", sizeof(p->name));
+   p->cwd = namei("/");
+@@ -256,45 +306,73 @@ userinit(void)
+ 
+ // Grow or shrink user memory by n bytes.
+ // Return 0 on success, -1 on failure.
+-int
+-growproc(int n)
++int growproc(int n)
+ {
+   uint64 sz;
+   struct proc *p = myproc();
+-
++  acquire(p->memlock);
+   sz = p->sz;
+-  if(n > 0){
+-    if((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0) {
++  if (n > 0)
++  {
++    if ((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0)
++    {
+       return -1;
+     }
+-  } else if(n < 0){
++  }
++  else if (n < 0)
++  {
+     sz = uvmdealloc(p->pagetable, sz, sz + n);
+   }
+   p->sz = sz;
++
++  ////////////////////////////
++  struct proc *pp;
++
++  for (pp = proc; pp < &proc[NPROC]; pp++)
++  {
++    if (p != pp && p->mem_id == pp->mem_id)
++    { // is a relative thread/process of p
++      if (n > 0)
++      { // map the grown pages
++        uvmalloc_mirror(p->pagetable, pp->pagetable, pp->sz, sz);
++      }
++      else if (n < 0)
++      { // unmap pages in range (new_size, old_size)
++        uvmunmap(pp->pagetable, PGROUNDUP(sz), (PGROUNDUP(pp->sz) - PGROUNDUP(sz)) / PGSIZE, 0);
++      }
++      pp->sz = sz;
++    }
++  }
++
++  release(p->memlock);
+   return 0;
+ }
+ 
+ // Create a new process, copying the parent.
+ // Sets up child kernel stack to return as if from fork() system call.
+-int
+-fork(void)
++int fork(void)
+ {
+   int i, pid;
+   struct proc *np;
+   struct proc *p = myproc();
+ 
+   // Allocate process.
+-  if((np = allocproc()) == 0){
++  if ((np = allocproc()) == 0)
++  {
+     return -1;
+   }
+ 
+   // Copy user memory from parent to child.
+-  if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
++  acquire(p->memlock);
++  if (uvmcopy(p->pagetable, np->pagetable, p->sz) < 0)
++  {
+     freeproc(np);
++    release(p->memlock);
+     release(&np->lock);
+     return -1;
+   }
+   np->sz = p->sz;
++  release(p->memlock);
+ 
+   // copy saved user registers.
+   *(np->trapframe) = *(p->trapframe);
+@@ -303,8 +381,8 @@ fork(void)
+   np->trapframe->a0 = 0;
+ 
+   // increment reference counts on open file descriptors.
+-  for(i = 0; i < NOFILE; i++)
+-    if(p->ofile[i])
++  for (i = 0; i < NOFILE; i++)
++    if (p->ofile[i])
+       np->ofile[i] = filedup(p->ofile[i]);
+   np->cwd = idup(p->cwd);
+ 
+@@ -327,13 +405,14 @@ fork(void)
+ 
+ // Pass p's abandoned children to init.
+ // Caller must hold wait_lock.
+-void
+-reparent(struct proc *p)
++void reparent(struct proc *p)
+ {
+   struct proc *pp;
+ 
+-  for(pp = proc; pp < &proc[NPROC]; pp++){
+-    if(pp->parent == p){
++  for (pp = proc; pp < &proc[NPROC]; pp++)
++  {
++    if (pp->parent == p)
++    {
+       pp->parent = initproc;
+       wakeup(initproc);
+     }
+@@ -343,17 +422,18 @@ reparent(struct proc *p)
+ // Exit the current process.  Does not return.
+ // An exited process remains in the zombie state
+ // until its parent calls wait().
+-void
+-exit(int status)
++void exit(int status)
+ {
+   struct proc *p = myproc();
+ 
+-  if(p == initproc)
++  if (p == initproc)
+     panic("init exiting");
+ 
+   // Close all open files.
+-  for(int fd = 0; fd < NOFILE; fd++){
+-    if(p->ofile[fd]){
++  for (int fd = 0; fd < NOFILE; fd++)
++  {
++    if (p->ofile[fd])
++    {
+       struct file *f = p->ofile[fd];
+       fileclose(f);
+       p->ofile[fd] = 0;
+@@ -372,11 +452,13 @@ exit(int status)
+ 
+   // Parent might be sleeping in wait().
+   wakeup(p->parent);
+-  
++
+   acquire(&p->lock);
+ 
+   p->xstate = status;
+   p->state = ZOMBIE;
++  /////////////////////
++  p->mem_id = -1;
+ 
+   release(&wait_lock);
+ 
+@@ -387,8 +469,7 @@ exit(int status)
+ 
+ // Wait for a child process to exit and return its pid.
+ // Return -1 if this process has no children.
+-int
+-wait(uint64 addr)
++int wait(uint64 addr)
+ {
+   struct proc *pp;
+   int havekids, pid;
+@@ -396,24 +477,34 @@ wait(uint64 addr)
+ 
+   acquire(&wait_lock);
+ 
+-  for(;;){
++  for (;;)
++  {
+     // Scan through table looking for exited children.
+     havekids = 0;
+-    for(pp = proc; pp < &proc[NPROC]; pp++){
+-      if(pp->parent == p){
++    for (pp = proc; pp < &proc[NPROC]; pp++)
++    {
++      if (pp->parent == p)
++      {
+         // make sure the child isn't still in exit() or swtch().
+         acquire(&pp->lock);
+ 
+         havekids = 1;
+-        if(pp->state == ZOMBIE){
++        if (pp->state == ZOMBIE)
++        {
+           // Found one.
+           pid = pp->pid;
+-          if(addr != 0 && copyout(p->pagetable, addr, (char *)&pp->xstate,
+-                                  sizeof(pp->xstate)) < 0) {
++          acquire(p->memlock);
++          if (addr != 0 && copyout(p->pagetable, addr, (char *)&pp->xstate,
++                                   sizeof(pp->xstate)) < 0)
++          {
++            release(p->memlock);
++
+             release(&pp->lock);
+             release(&wait_lock);
+             return -1;
+           }
++          release(p->memlock);
++
+           freeproc(pp);
+           release(&pp->lock);
+           release(&wait_lock);
+@@ -424,13 +515,14 @@ wait(uint64 addr)
+     }
+ 
+     // No point waiting if we don't have any children.
+-    if(!havekids || killed(p)){
++    if (!havekids || killed(p))
++    {
+       release(&wait_lock);
+       return -1;
+     }
+-    
++
+     // Wait for a child to exit.
+-    sleep(p, &wait_lock);  //DOC: wait-sleep
++    sleep(p, &wait_lock); // DOC: wait-sleep
+   }
+ }
+ 
+@@ -441,22 +533,24 @@ wait(uint64 addr)
+ //  - swtch to start running that process.
+ //  - eventually that process transfers control
+ //    via swtch back to the scheduler.
+-void
+-scheduler(void)
++void scheduler(void)
+ {
+   struct proc *p;
+   struct cpu *c = mycpu();
+ 
+   c->proc = 0;
+-  for(;;){
++  for (;;)
++  {
+     // The most recent process to run may have had interrupts
+     // turned off; enable them to avoid a deadlock if all
+     // processes are waiting.
+     intr_on();
+ 
+-    for(p = proc; p < &proc[NPROC]; p++) {
++    for (p = proc; p < &proc[NPROC]; p++)
++    {
+       acquire(&p->lock);
+-      if(p->state == RUNNABLE) {
++      if (p->state == RUNNABLE)
++      {
+         // Switch to chosen process.  It is the process's job
+         // to release its lock and then reacquire it
+         // before jumping back to us.
+@@ -480,19 +574,18 @@ scheduler(void)
+ // be proc->intena and proc->noff, but that would
+ // break in the few places where a lock is held but
+ // there's no process.
+-void
+-sched(void)
++void sched(void)
+ {
+   int intena;
+   struct proc *p = myproc();
+ 
+-  if(!holding(&p->lock))
++  if (!holding(&p->lock))
+     panic("sched p->lock");
+-  if(mycpu()->noff != 1)
++  if (mycpu()->noff != 1)
+     panic("sched locks");
+-  if(p->state == RUNNING)
++  if (p->state == RUNNING)
+     panic("sched running");
+-  if(intr_get())
++  if (intr_get())
+     panic("sched interruptible");
+ 
+   intena = mycpu()->intena;
+@@ -501,8 +594,7 @@ sched(void)
+ }
+ 
+ // Give up the CPU for one scheduling round.
+-void
+-yield(void)
++void yield(void)
+ {
+   struct proc *p = myproc();
+   acquire(&p->lock);
+@@ -513,15 +605,15 @@ yield(void)
+ 
+ // A fork child's very first scheduling by scheduler()
+ // will swtch to forkret.
+-void
+-forkret(void)
++void forkret(void)
+ {
+   static int first = 1;
+ 
+   // Still holding p->lock from scheduler.
+   release(&myproc()->lock);
+ 
+-  if (first) {
++  if (first)
++  {
+     // File system initialization must be run in the context of a
+     // regular process (e.g., because it calls sleep), and thus cannot
+     // be run from main().
+@@ -537,11 +629,10 @@ forkret(void)
+ 
+ // Atomically release lock and sleep on chan.
+ // Reacquires lock when awakened.
+-void
+-sleep(void *chan, struct spinlock *lk)
++void sleep(void *chan, struct spinlock *lk)
+ {
+   struct proc *p = myproc();
+-  
++
+   // Must acquire p->lock in order to
+   // change p->state and then call sched.
+   // Once we hold p->lock, we can be
+@@ -549,7 +640,7 @@ sleep(void *chan, struct spinlock *lk)
+   // (wakeup locks p->lock),
+   // so it's okay to release lk.
+ 
+-  acquire(&p->lock);  //DOC: sleeplock1
++  acquire(&p->lock); // DOC: sleeplock1
+   release(lk);
+ 
+   // Go to sleep.
+@@ -565,18 +656,55 @@ sleep(void *chan, struct spinlock *lk)
+   release(&p->lock);
+   acquire(lk);
+ }
++//////////////////////////////////////////////
++void sleep_thread(uint64 lock_address)
++{
++  struct proc *p = myproc();
++
++  acquire(&p->lock); // DOC: sleeplock1
++  // we reset value at lock_address, in effect releasing the mutex lock
++  acquire(p->memlock);
++  thread_mutex_lockrelease(p->pagetable, lock_address);
++  release(p->memlock);
++  p->state = SLEEPING;
++
++  sched();
++  // Reacquire original lock.
++  release(&p->lock);
++}
+ 
+ // Wake up all processes sleeping on chan.
+ // Must be called without any p->lock.
+-void
+-wakeup(void *chan)
++void wakeup(void *chan)
+ {
+   struct proc *p;
+ 
+-  for(p = proc; p < &proc[NPROC]; p++) {
+-    if(p != myproc()){
++  for (p = proc; p < &proc[NPROC]; p++)
++  {
++    if (p != myproc())
++    {
+       acquire(&p->lock);
+-      if(p->state == SLEEPING && p->chan == chan) {
++      if (p->state == SLEEPING && p->chan == chan)
++      {
++        p->state = RUNNABLE;
++      }
++      release(&p->lock);
++    }
++  }
++}
++//////////////////////////////
++
++void wakeup_thread(uint64 pro_id)
++{
++  struct proc *p;
++
++  for (p = proc; p < &proc[NPROC]; p++)
++  {
++    if (p != myproc())
++    {
++      acquire(&p->lock);
++      if (p->state == SLEEPING && p->pid == pro_id)
++      {
+         p->state = RUNNABLE;
+       }
+       release(&p->lock);
+@@ -587,16 +715,18 @@ wakeup(void *chan)
+ // Kill the process with the given pid.
+ // The victim won't exit until it tries to return
+ // to user space (see usertrap() in trap.c).
+-int
+-kill(int pid)
++int kill(int pid)
+ {
+   struct proc *p;
+ 
+-  for(p = proc; p < &proc[NPROC]; p++){
++  for (p = proc; p < &proc[NPROC]; p++)
++  {
+     acquire(&p->lock);
+-    if(p->pid == pid){
++    if (p->pid == pid)
++    {
+       p->killed = 1;
+-      if(p->state == SLEEPING){
++      if (p->state == SLEEPING)
++      {
+         // Wake process from sleep().
+         p->state = RUNNABLE;
+       }
+@@ -608,19 +738,17 @@ kill(int pid)
+   return -1;
+ }
+ 
+-void
+-setkilled(struct proc *p)
++void setkilled(struct proc *p)
+ {
+   acquire(&p->lock);
+   p->killed = 1;
+   release(&p->lock);
+ }
+ 
+-int
+-killed(struct proc *p)
++int killed(struct proc *p)
+ {
+   int k;
+-  
++
+   acquire(&p->lock);
+   k = p->killed;
+   release(&p->lock);
+@@ -630,13 +758,19 @@ killed(struct proc *p)
+ // Copy to either a user address, or kernel address,
+ // depending on usr_dst.
+ // Returns 0 on success, -1 on error.
+-int
+-either_copyout(int user_dst, uint64 dst, void *src, uint64 len)
++int either_copyout(int user_dst, uint64 dst, void *src, uint64 len)
+ {
+   struct proc *p = myproc();
+-  if(user_dst){
+-    return copyout(p->pagetable, dst, src, len);
+-  } else {
++  if (user_dst)
++  {
++    // return copyout(p->pagetable, dst, src, len);////////////////////
++    acquire(p->memlock);
++    int result = copyout(p->pagetable, dst, src, len);
++    release(p->memlock);
++    return result;
++  }
++  else
++  {
+     memmove((char *)dst, src, len);
+     return 0;
+   }
+@@ -645,14 +779,20 @@ either_copyout(int user_dst, uint64 dst, void *src, uint64 len)
+ // Copy from either a user address, or kernel address,
+ // depending on usr_src.
+ // Returns 0 on success, -1 on error.
+-int
+-either_copyin(void *dst, int user_src, uint64 src, uint64 len)
++int either_copyin(void *dst, int user_src, uint64 src, uint64 len)
+ {
+   struct proc *p = myproc();
+-  if(user_src){
+-    return copyin(p->pagetable, dst, src, len);
+-  } else {
+-    memmove(dst, (char*)src, len);
++  if (user_src)
++  {
++    // return copyin(p->pagetable, dst, src, len);//////////
++    acquire(p->memlock);
++    int result = copyin(p->pagetable, dst, src, len);
++    release(p->memlock);
++    return result;
++  }
++  else
++  {
++    memmove(dst, (char *)src, len);
+     return 0;
+   }
+ }
+@@ -660,25 +800,24 @@ either_copyin(void *dst, int user_src, uint64 src, uint64 len)
+ // Print a process listing to console.  For debugging.
+ // Runs when user types ^P on console.
+ // No lock to avoid wedging a stuck machine further.
+-void
+-procdump(void)
++void procdump(void)
+ {
+   static char *states[] = {
+-  [UNUSED]    "unused",
+-  [USED]      "used",
+-  [SLEEPING]  "sleep ",
+-  [RUNNABLE]  "runble",
+-  [RUNNING]   "run   ",
+-  [ZOMBIE]    "zombie"
+-  };
++      [UNUSED] "unused",
++      [USED] "used",
++      [SLEEPING] "sleep ",
++      [RUNNABLE] "runble",
++      [RUNNING] "run   ",
++      [ZOMBIE] "zombie"};
+   struct proc *p;
+   char *state;
+ 
+   printf("\n");
+-  for(p = proc; p < &proc[NPROC]; p++){
+-    if(p->state == UNUSED)
++  for (p = proc; p < &proc[NPROC]; p++)
++  {
++    if (p->state == UNUSED)
+       continue;
+-    if(p->state >= 0 && p->state < NELEM(states) && states[p->state])
++    if (p->state >= 0 && p->state < NELEM(states) && states[p->state])
+       state = states[p->state];
+     else
+       state = "???";
+@@ -686,3 +825,140 @@ procdump(void)
+     printf("\n");
+   }
+ }
++
++int thread_create_func(void (*fcn)(void *), void *arg, void *stack)
++{
++  int i, tid;
++  struct proc *np;
++  struct proc *p = myproc();
++  if ((np = allocproc()) == 0)
++  {
++    return -1;
++  }
++  np->mem_id = p->mem_id;
++  np->memlock = &memlocks[np->mem_id];
++
++  acquire(np->memlock);
++  // Copy user memory from parent to child.
++  if (uvmmirror(p->pagetable, np->pagetable, p->sz) < 0)
++  {
++    freeproc(np);
++    release(&np->lock);
++    return -1;
++  }
++  release(np->memlock);
++
++  np->sz = p->sz;
++
++  // saved user registers.
++  *(np->trapframe) = *(p->trapframe);
++
++  // change program counter of thread to given function pointer fcn
++  np->trapframe->epc = (uint64)fcn;
++
++  // make thread sp point to top(first) of given stack
++  // page, and align to risc-v 16 byte alignment
++  // no guard page for now
++  np->trapframe->sp = (uint64)stack + PGSIZE;
++  np->trapframe->sp -= np->trapframe->sp % 16;
++
++  // copy argument of fcn to argument register a0 #BUGSRC
++  // may shift to exec.c:91-99 if not working
++  np->trapframe->a0 = (uint64)arg;
++  // use copyin to copy arg from user virtual addr
++  // Cause fork to return 0 in the child.
++  // np->trapframe->a0 = 0;
++  // fake return pc
++  np->trapframe->ra = 0xffffffff;
++  np->is_thread = 1;
++  // increment reference counts on open file descriptors.
++  for (i = 0; i < NOFILE; i++)
++    if (p->ofile[i])
++      np->ofile[i] = filedup(p->ofile[i]);
++  np->cwd = idup(p->cwd);
++
++  safestrcpy(np->name, p->name, sizeof(p->name));
++
++  tid = np->pid;
++
++  release(&np->lock);
++
++  acquire(&wait_lock);
++  np->parent = p;
++  release(&wait_lock);
++
++  acquire(&np->lock);
++  np->state = RUNNABLE;
++  release(&np->lock);
++
++  return tid;
++}
++
++
++int thread_join_func(int thread_id)
++{
++  struct proc *pp;
++  int havekids, pid;
++  struct proc *p = myproc();
++
++  acquire(&wait_lock);
++
++  for(;;){
++    // Scan through table looking for exited children with same thread_id
++    havekids = 0;
++    for(pp = proc; pp < &proc[NPROC]; pp++){
++      if(pp->parent == p && pp->pid == thread_id){
++        acquire(&pp->lock);
++        havekids = 1;
++        if(pp->state == ZOMBIE){
++          pid = pp->pid;
++          freeproc(pp);
++          release(&pp->lock);
++          release(&wait_lock);
++          return pid;
++        }
++        release(&pp->lock);
++      }
++    }
++    if(!havekids || killed(p)){
++      release(&wait_lock);
++      return -1;
++    }
++    sleep(p, &wait_lock); 
++  }
++}
++
++void
++thread_exit_func(int status)
++{
++  struct proc *p = myproc();
++
++  if(p == initproc)
++    panic("init exiting");
++
++  for(int fd = 0; fd < NOFILE; fd++){
++    if(p->ofile[fd]){
++      struct file *f = p->ofile[fd];
++      fileclose(f);
++      p->ofile[fd] = 0;
++    }
++  }
++
++  begin_op();
++  iput(p->cwd);
++  end_op();
++  p->cwd = 0;
++
++  acquire(&wait_lock);
++  reparent(p);
++  wakeup(p->parent);
++
++  acquire(&p->lock);
++
++  p->xstate = status;
++  p->state = ZOMBIE;
++  p->mem_id = -1;
++  release(&wait_lock);
++  sched();
++  panic("zombie exit");
++}
+\ No newline at end of file
+diff --git a/kernel/proc.h b/kernel/proc.h
+index d021857..6a6f998 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -104,4 +104,17 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++
++
++//////////////////////////////////
++
++struct spinlock *memlock;	// find places to set and release the locks 
++  int is_thread;               // if it is thread
++  int mem_id;                   // All threads will have the same physical pages with the mothrer, hence the same memory ID
++
++
++
++
++
++
+ };
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index ed65409..435391b 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -101,6 +101,9 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++extern uint64 sys_thread_create(void);
++extern uint64 sys_thread_join(void);
++extern uint64 sys_thread_exit(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -126,6 +129,10 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_thread_create] sys_thread_create,
++[SYS_thread_join] sys_thread_join,
++[SYS_thread_exit] sys_thread_exit,
++
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..db9cf41 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,7 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++
++#define SYS_thread_create 22
++#define SYS_thread_join 23
++#define SYS_thread_exit 24
+\ No newline at end of file
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 3b4d5bd..a628cc1 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -91,3 +91,39 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++
++uint64
++sys_thread_create(void)
++{
++  uint64 fcn;
++  uint64 arg;
++  uint64 stack;
++  argaddr(0, &fcn);
++  argaddr(1, &arg);
++  argaddr(2, &stack);
++
++  return thread_create_func((void*) fcn, (void*) arg, (void*) stack);
++}
++
++uint64
++sys_thread_join(void)
++{
++  int tid;
++  argint(0, &tid);
++  return thread_join_func(tid);
++}
++
++
++uint64
++sys_thread_exit(void)
++{
++  int tid;
++  argint(0, &tid);
++  thread_exit_func(tid);
++  return 0;
++}
++
++
++
++
+diff --git a/kernel/vm.c b/kernel/vm.c
+index 5c31e87..51862f4 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -11,7 +11,7 @@
+  */
+ pagetable_t kernel_pagetable;
+ 
+-extern char etext[];  // kernel.ld sets this to end of kernel code.
++extern char etext[]; // kernel.ld sets this to end of kernel code.
+ 
+ extern char trampoline[]; // trampoline.S
+ 
+@@ -21,7 +21,7 @@ kvmmake(void)
+ {
+   pagetable_t kpgtbl;
+ 
+-  kpgtbl = (pagetable_t) kalloc();
++  kpgtbl = (pagetable_t)kalloc();
+   memset(kpgtbl, 0, PGSIZE);
+ 
+   // uart registers
+@@ -34,10 +34,10 @@ kvmmake(void)
+   kvmmap(kpgtbl, PLIC, PLIC, 0x400000, PTE_R | PTE_W);
+ 
+   // map kernel text executable and read-only.
+-  kvmmap(kpgtbl, KERNBASE, KERNBASE, (uint64)etext-KERNBASE, PTE_R | PTE_X);
++  kvmmap(kpgtbl, KERNBASE, KERNBASE, (uint64)etext - KERNBASE, PTE_R | PTE_X);
+ 
+   // map kernel data and the physical RAM we'll make use of.
+-  kvmmap(kpgtbl, (uint64)etext, (uint64)etext, PHYSTOP-(uint64)etext, PTE_R | PTE_W);
++  kvmmap(kpgtbl, (uint64)etext, (uint64)etext, PHYSTOP - (uint64)etext, PTE_R | PTE_W);
+ 
+   // map the trampoline for trap entry/exit to
+   // the highest virtual address in the kernel.
+@@ -45,21 +45,19 @@ kvmmake(void)
+ 
+   // allocate and map a kernel stack for each process.
+   proc_mapstacks(kpgtbl);
+-  
++
+   return kpgtbl;
+ }
+ 
+ // Initialize the one kernel_pagetable
+-void
+-kvminit(void)
++void kvminit(void)
+ {
+   kernel_pagetable = kvmmake();
+ }
+ 
+ // Switch h/w page table register to the kernel's page table,
+ // and enable paging.
+-void
+-kvminithart()
++void kvminithart()
+ {
+   // wait for any previous writes to the page table memory to finish.
+   sfence_vma();
+@@ -85,15 +83,19 @@ kvminithart()
+ pte_t *
+ walk(pagetable_t pagetable, uint64 va, int alloc)
+ {
+-  if(va >= MAXVA)
++  if (va >= MAXVA)
+     panic("walk");
+ 
+-  for(int level = 2; level > 0; level--) {
++  for (int level = 2; level > 0; level--)
++  {
+     pte_t *pte = &pagetable[PX(level, va)];
+-    if(*pte & PTE_V) {
++    if (*pte & PTE_V)
++    {
+       pagetable = (pagetable_t)PTE2PA(*pte);
+-    } else {
+-      if(!alloc || (pagetable = (pde_t*)kalloc()) == 0)
++    }
++    else
++    {
++      if (!alloc || (pagetable = (pde_t *)kalloc()) == 0)
+         return 0;
+       memset(pagetable, 0, PGSIZE);
+       *pte = PA2PTE(pagetable) | PTE_V;
+@@ -111,15 +113,15 @@ walkaddr(pagetable_t pagetable, uint64 va)
+   pte_t *pte;
+   uint64 pa;
+ 
+-  if(va >= MAXVA)
++  if (va >= MAXVA)
+     return 0;
+ 
+   pte = walk(pagetable, va, 0);
+-  if(pte == 0)
++  if (pte == 0)
+     return 0;
+-  if((*pte & PTE_V) == 0)
++  if ((*pte & PTE_V) == 0)
+     return 0;
+-  if((*pte & PTE_U) == 0)
++  if ((*pte & PTE_U) == 0)
+     return 0;
+   pa = PTE2PA(*pte);
+   return pa;
+@@ -128,10 +130,9 @@ walkaddr(pagetable_t pagetable, uint64 va)
+ // add a mapping to the kernel page table.
+ // only used when booting.
+ // does not flush TLB or enable paging.
+-void
+-kvmmap(pagetable_t kpgtbl, uint64 va, uint64 pa, uint64 sz, int perm)
++void kvmmap(pagetable_t kpgtbl, uint64 va, uint64 pa, uint64 sz, int perm)
+ {
+-  if(mappages(kpgtbl, va, sz, pa, perm) != 0)
++  if (mappages(kpgtbl, va, sz, pa, perm) != 0)
+     panic("kvmmap");
+ }
+ 
+@@ -140,30 +141,30 @@ kvmmap(pagetable_t kpgtbl, uint64 va, uint64 pa, uint64 sz, int perm)
+ // va and size MUST be page-aligned.
+ // Returns 0 on success, -1 if walk() couldn't
+ // allocate a needed page-table page.
+-int
+-mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
++int mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
+ {
+   uint64 a, last;
+   pte_t *pte;
+ 
+-  if((va % PGSIZE) != 0)
++  if ((va % PGSIZE) != 0)
+     panic("mappages: va not aligned");
+ 
+-  if((size % PGSIZE) != 0)
++  if ((size % PGSIZE) != 0)
+     panic("mappages: size not aligned");
+ 
+-  if(size == 0)
++  if (size == 0)
+     panic("mappages: size");
+-  
++
+   a = va;
+   last = va + size - PGSIZE;
+-  for(;;){
+-    if((pte = walk(pagetable, a, 1)) == 0)
++  for (;;)
++  {
++    if ((pte = walk(pagetable, a, 1)) == 0)
+       return -1;
+-    if(*pte & PTE_V)
++    if (*pte & PTE_V)
+       panic("mappages: remap");
+     *pte = PA2PTE(pa) | perm | PTE_V;
+-    if(a == last)
++    if (a == last)
+       break;
+     a += PGSIZE;
+     pa += PGSIZE;
+@@ -174,25 +175,26 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
+ // Remove npages of mappings starting from va. va must be
+ // page-aligned. The mappings must exist.
+ // Optionally free the physical memory.
+-void
+-uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
++void uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
+ {
+   uint64 a;
+   pte_t *pte;
+ 
+-  if((va % PGSIZE) != 0)
++  if ((va % PGSIZE) != 0)
+     panic("uvmunmap: not aligned");
+ 
+-  for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
+-    if((pte = walk(pagetable, a, 0)) == 0)
++  for (a = va; a < va + npages * PGSIZE; a += PGSIZE)
++  {
++    if ((pte = walk(pagetable, a, 0)) == 0)
+       panic("uvmunmap: walk");
+-    if((*pte & PTE_V) == 0)
++    if ((*pte & PTE_V) == 0)
+       panic("uvmunmap: not mapped");
+-    if(PTE_FLAGS(*pte) == PTE_V)
++    if (PTE_FLAGS(*pte) == PTE_V)
+       panic("uvmunmap: not a leaf");
+-    if(do_free){
++    if (do_free)
++    {
+       uint64 pa = PTE2PA(*pte);
+-      kfree((void*)pa);
++      kfree((void *)pa);
+     }
+     *pte = 0;
+   }
+@@ -204,8 +206,8 @@ pagetable_t
+ uvmcreate()
+ {
+   pagetable_t pagetable;
+-  pagetable = (pagetable_t) kalloc();
+-  if(pagetable == 0)
++  pagetable = (pagetable_t)kalloc();
++  if (pagetable == 0)
+     return 0;
+   memset(pagetable, 0, PGSIZE);
+   return pagetable;
+@@ -214,16 +216,15 @@ uvmcreate()
+ // Load the user initcode into address 0 of pagetable,
+ // for the very first process.
+ // sz must be less than a page.
+-void
+-uvmfirst(pagetable_t pagetable, uchar *src, uint sz)
++void uvmfirst(pagetable_t pagetable, uchar *src, uint sz)
+ {
+   char *mem;
+ 
+-  if(sz >= PGSIZE)
++  if (sz >= PGSIZE)
+     panic("uvmfirst: more than a page");
+   mem = kalloc();
+   memset(mem, 0, PGSIZE);
+-  mappages(pagetable, 0, PGSIZE, (uint64)mem, PTE_W|PTE_R|PTE_X|PTE_U);
++  mappages(pagetable, 0, PGSIZE, (uint64)mem, PTE_W | PTE_R | PTE_X | PTE_U);
+   memmove(mem, src, sz);
+ }
+ 
+@@ -235,18 +236,21 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
+   char *mem;
+   uint64 a;
+ 
+-  if(newsz < oldsz)
++  if (newsz < oldsz)
+     return oldsz;
+ 
+   oldsz = PGROUNDUP(oldsz);
+-  for(a = oldsz; a < newsz; a += PGSIZE){
++  for (a = oldsz; a < newsz; a += PGSIZE)
++  {
+     mem = kalloc();
+-    if(mem == 0){
++    if (mem == 0)
++    {
+       uvmdealloc(pagetable, a, oldsz);
+       return 0;
+     }
+     memset(mem, 0, PGSIZE);
+-    if(mappages(pagetable, a, PGSIZE, (uint64)mem, PTE_R|PTE_U|xperm) != 0){
++    if (mappages(pagetable, a, PGSIZE, (uint64)mem, PTE_R | PTE_U | xperm) != 0)
++    {
+       kfree(mem);
+       uvmdealloc(pagetable, a, oldsz);
+       return 0;
+@@ -262,10 +266,11 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
+ uint64
+ uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
+ {
+-  if(newsz >= oldsz)
++  if (newsz >= oldsz)
+     return oldsz;
+ 
+-  if(PGROUNDUP(newsz) < PGROUNDUP(oldsz)){
++  if (PGROUNDUP(newsz) < PGROUNDUP(oldsz))
++  {
+     int npages = (PGROUNDUP(oldsz) - PGROUNDUP(newsz)) / PGSIZE;
+     uvmunmap(pagetable, PGROUNDUP(newsz), npages, 1);
+   }
+@@ -275,31 +280,40 @@ uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
+ 
+ // Recursively free page-table pages.
+ // All leaf mappings must already have been removed.
+-void
+-freewalk(pagetable_t pagetable)
++void freewalk(pagetable_t pagetable)
+ {
+   // there are 2^9 = 512 PTEs in a page table.
+-  for(int i = 0; i < 512; i++){
++  for (int i = 0; i < 512; i++)
++  {
+     pte_t pte = pagetable[i];
+-    if((pte & PTE_V) && (pte & (PTE_R|PTE_W|PTE_X)) == 0){
++    if ((pte & PTE_V) && (pte & (PTE_R | PTE_W | PTE_X)) == 0)
++    {
+       // this PTE points to a lower-level page table.
+       uint64 child = PTE2PA(pte);
+       freewalk((pagetable_t)child);
+       pagetable[i] = 0;
+-    } else if(pte & PTE_V){
++    }
++    else if (pte & PTE_V)
++    {
+       panic("freewalk: leaf");
+     }
+   }
+-  kfree((void*)pagetable);
++  kfree((void *)pagetable);
+ }
+ 
+ // Free user memory pages,
+ // then free page-table pages.
+-void
+-uvmfree(pagetable_t pagetable, uint64 sz)
++void uvmfree(pagetable_t pagetable, uint64 sz)
+ {
+-  if(sz > 0)
+-    uvmunmap(pagetable, 0, PGROUNDUP(sz)/PGSIZE, 1);
++  if (sz > 0)
++    uvmunmap(pagetable, 0, PGROUNDUP(sz) / PGSIZE, 1);
++  freewalk(pagetable);
++}
++
++void uvmfree_thread(pagetable_t pagetable, uint64 sz)
++{
++  if (sz > 0)
++    uvmunmap(pagetable, 0, PGROUNDUP(sz) / PGSIZE, 0);
+   freewalk(pagetable);
+ }
+ 
+@@ -309,45 +323,100 @@ uvmfree(pagetable_t pagetable, uint64 sz)
+ // physical memory.
+ // returns 0 on success, -1 on failure.
+ // frees any allocated pages on failure.
+-int
+-uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
++int uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+ {
+   pte_t *pte;
+   uint64 pa, i;
+   uint flags;
+   char *mem;
+ 
+-  for(i = 0; i < sz; i += PGSIZE){
+-    if((pte = walk(old, i, 0)) == 0)
++  for (i = 0; i < sz; i += PGSIZE)
++  {
++    if ((pte = walk(old, i, 0)) == 0)
+       panic("uvmcopy: pte should exist");
+-    if((*pte & PTE_V) == 0)
++    if ((*pte & PTE_V) == 0)
+       panic("uvmcopy: page not present");
+     pa = PTE2PA(*pte);
+     flags = PTE_FLAGS(*pte);
+-    if((mem = kalloc()) == 0)
++    if ((mem = kalloc()) == 0)
+       goto err;
+-    memmove(mem, (char*)pa, PGSIZE);
+-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
++    memmove(mem, (char *)pa, PGSIZE);
++    if (mappages(new, i, PGSIZE, (uint64)mem, flags) != 0)
++    {
+       kfree(mem);
+       goto err;
+     }
+   }
+   return 0;
+ 
++err:
++  uvmunmap(new, 0, i / PGSIZE, 1);
++  return -1;
++}
++
++int uvmmirror(pagetable_t old, pagetable_t new, uint64 sz)
++{
++  pte_t *pte;
++  uint64 pa, i;
++  uint flags;
++
++  for(i = 0; i < sz; i += PGSIZE){
++    if((pte = walk(old, i, 0)) == 0)
++      panic("uvmmirror: pte should exist");
++    if((*pte & PTE_V) == 0)
++      panic("uvmmirror: page not present");
++    pa = PTE2PA(*pte);
++    flags = PTE_FLAGS(*pte);
++    if(mappages(new, i, PGSIZE, pa, flags) != 0){
++      kfree((void*)pa);
++      goto err;
++    }
++  }
++  return 0;
++
+  err:
+   uvmunmap(new, 0, i / PGSIZE, 1);
+   return -1;
+ }
+ 
++
++
++int uvmalloc_mirror(pagetable_t old, pagetable_t new, uint64 new_sz, uint64 old_sz)
++{
++  pte_t *pte;
++  uint64 pa, i;
++  uint flags;
++
++  for(i = PGROUNDUP(old_sz); i < new_sz; i += PGSIZE){
++    if((pte = walk(old, i, 0)) == 0)
++      panic("uvmgrow_mirror: pte should exist");
++    if((*pte & PTE_V) == 0)
++      panic("uvmgrow_mirror: page not present");
++    pa = PTE2PA(*pte);
++    flags = PTE_FLAGS(*pte);
++    if(mappages(new, i, PGSIZE, pa, flags) != 0){
++      kfree((void*)pa);
++      goto err;
++    }
++  }
++  return 0;
++
++ err:
++  uvmunmap(new, 0, i / PGSIZE, 1);
++  return -1;
++}
++
++
++
++
+ // mark a PTE invalid for user access.
+ // used by exec for the user stack guard page.
+-void
+-uvmclear(pagetable_t pagetable, uint64 va)
++void uvmclear(pagetable_t pagetable, uint64 va)
+ {
+   pte_t *pte;
+-  
++
+   pte = walk(pagetable, va, 0);
+-  if(pte == 0)
++  if (pte == 0)
+     panic("uvmclear");
+   *pte &= ~PTE_U;
+ }
+@@ -355,23 +424,23 @@ uvmclear(pagetable_t pagetable, uint64 va)
+ // Copy from kernel to user.
+ // Copy len bytes from src to virtual address dstva in a given page table.
+ // Return 0 on success, -1 on error.
+-int
+-copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
++int copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
+ {
+   uint64 n, va0, pa0;
+   pte_t *pte;
+ 
+-  while(len > 0){
++  while (len > 0)
++  {
+     va0 = PGROUNDDOWN(dstva);
+-    if(va0 >= MAXVA)
++    if (va0 >= MAXVA)
+       return -1;
+     pte = walk(pagetable, va0, 0);
+-    if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0 ||
+-       (*pte & PTE_W) == 0)
++    if (pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0 ||
++        (*pte & PTE_W) == 0)
+       return -1;
+     pa0 = PTE2PA(*pte);
+     n = PGSIZE - (dstva - va0);
+-    if(n > len)
++    if (n > len)
+       n = len;
+     memmove((void *)(pa0 + (dstva - va0)), src, n);
+ 
+@@ -382,21 +451,37 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
+   return 0;
+ }
+ 
++
++int
++thread_mutex_lockrelease(pagetable_t pagetable, uint64 lk_addr)
++{
++  uint64 va0, pa0;
++
++  va0 = PGROUNDDOWN(lk_addr);
++  pa0 = walkaddr(pagetable, va0);
++  if(pa0 == 0)
++    return -1;
++  __sync_synchronize();
++  __sync_lock_release((uint8*)(pa0 + (lk_addr - va0)));
++
++  return 0;
++}
++
+ // Copy from user to kernel.
+ // Copy len bytes to dst from virtual address srcva in a given page table.
+ // Return 0 on success, -1 on error.
+-int
+-copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
++int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
+ {
+   uint64 n, va0, pa0;
+ 
+-  while(len > 0){
++  while (len > 0)
++  {
+     va0 = PGROUNDDOWN(srcva);
+     pa0 = walkaddr(pagetable, va0);
+-    if(pa0 == 0)
++    if (pa0 == 0)
+       return -1;
+     n = PGSIZE - (srcva - va0);
+-    if(n > len)
++    if (n > len)
+       n = len;
+     memmove(dst, (void *)(pa0 + (srcva - va0)), n);
+ 
+@@ -411,28 +496,32 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
+ // Copy bytes to dst from virtual address srcva in a given page table,
+ // until a '\0', or max.
+ // Return 0 on success, -1 on error.
+-int
+-copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
++int copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+ {
+   uint64 n, va0, pa0;
+   int got_null = 0;
+ 
+-  while(got_null == 0 && max > 0){
++  while (got_null == 0 && max > 0)
++  {
+     va0 = PGROUNDDOWN(srcva);
+     pa0 = walkaddr(pagetable, va0);
+-    if(pa0 == 0)
++    if (pa0 == 0)
+       return -1;
+     n = PGSIZE - (srcva - va0);
+-    if(n > max)
++    if (n > max)
+       n = max;
+ 
+-    char *p = (char *) (pa0 + (srcva - va0));
+-    while(n > 0){
+-      if(*p == '\0'){
++    char *p = (char *)(pa0 + (srcva - va0));
++    while (n > 0)
++    {
++      if (*p == '\0')
++      {
+         *dst = '\0';
+         got_null = 1;
+         break;
+-      } else {
++      }
++      else
++      {
+         *dst = *p;
+       }
+       --n;
+@@ -443,9 +532,12 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+ 
+     srcva = va0 + PGSIZE;
+   }
+-  if(got_null){
++  if (got_null)
++  {
+     return 0;
+-  } else {
++  }
++  else
++  {
+     return -1;
+   }
+ }
+diff --git a/user/threads.c b/user/threads.c
+new file mode 100644
+index 0000000..8aeceab
+--- /dev/null
++++ b/user/threads.c
+@@ -0,0 +1,164 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++
++struct thread_spinlock {
++    uint8 locked;  
++    char *name;    
++    int owner_pid; 
++};
++
++// Mutex structure
++struct thread_mutex {
++    uint8 is_locked;  // Lock state
++    char *name;       // Name of the lock
++    int owner_pid;    // PID of the lock owner
++};
++
++void thread_spin_init(struct thread_spinlock *lock, char *name);
++void thread_spin_lock(struct thread_spinlock *lock);
++void thread_spin_unlock(struct thread_spinlock *lock);
++
++int thread_holding_spinlock(struct thread_spinlock *lock);
++void thread_mutex_init(struct thread_mutex *m, char *name);
++void thread_mutex_lock(struct thread_mutex *m);
++void thread_mutex_unlock(struct thread_mutex *m);
++int thread_holding_mutex(struct thread_mutex *m);
++
++struct thread_spinlock lock;
++struct thread_spinlock out_lock;
++
++struct balance {
++    char name[32];
++    int amount;
++};
++
++volatile int total_balance = 0;
++
++volatile unsigned int delay(unsigned int d) {
++    unsigned int i;
++    for (i = 0; i < d; i++) {
++        __asm volatile("nop" :::);
++    }
++    return i;
++}
++
++void do_work(void *arg) {
++    int i;
++    int old;
++
++    struct balance *b = (struct balance*) arg;
++    thread_spin_lock(&out_lock);
++    printf("Starting do_work: s:%s\n", b->name);
++    thread_spin_unlock(&out_lock);
++
++    for (i = 0; i < b->amount; i++) {
++        thread_spin_lock(&lock);
++        old = total_balance;
++        delay(100000);
++        total_balance = old + 1;
++        thread_spin_unlock(&lock);
++    }
++
++    thread_spin_lock(&out_lock);
++    printf("Done s:%s\n", b->name);
++    thread_spin_unlock(&out_lock);
++
++    thread_exit();
++    return;
++}
++
++// Spinlock Functions
++void thread_spin_init(struct thread_spinlock *lock, char *name) {
++    lock->locked = 0;
++    lock->name = name;
++    lock->owner_pid = 0;
++}
++
++void thread_spin_lock(struct thread_spinlock *lock) {
++    if (thread_holding_spinlock(lock)) {
++        printf("error thread_spin_lock: lock held\n");
++        exit(-1);
++    }
++
++    while (__sync_lock_test_and_set(&lock->locked, 1) != 0) ;
++    __sync_synchronize();
++    int pid = getpid();
++    int old_pid = lock->owner_pid;
++    while (__sync_lock_test_and_set(&lock->owner_pid, pid) != old_pid) ;
++}
++
++void thread_spin_unlock(struct thread_spinlock *lock) {
++    if (!thread_holding_spinlock(lock)) {
++        printf("error thread_spin_unlock: lock not held\n");
++        exit(-1);
++    }
++
++    __sync_lock_release(&lock->owner_pid);
++    __sync_synchronize();
++    __sync_lock_release(&lock->locked);
++}
++
++int thread_holding_spinlock(struct thread_spinlock *lock) {
++    return (lock->locked && lock->owner_pid == getpid());
++}
++
++// Mutex Functions
++void thread_mutex_init(struct thread_mutex *m, char *name) {
++    m->is_locked = 0;
++    m->name = name;
++    m->owner_pid = 0;
++}
++
++void thread_mutex_lock(struct thread_mutex *m) {
++    while (__sync_lock_test_and_set(&m->is_locked, 1) != 0) {
++        sleep(1);
++    }
++
++    int pid = getpid();
++    int old_pid = m->owner_pid;
++    while (__sync_lock_test_and_set(&m->owner_pid, pid) != old_pid) {
++        sleep(1);
++    }
++}
++
++void thread_mutex_unlock(struct thread_mutex *m) {
++    if (!thread_holding_mutex(m)) {
++        printf("error thread_mutex_unlock: lock not held\n");
++        exit(-1);
++    }
++
++    __sync_lock_release(&m->owner_pid);
++    __sync_synchronize();
++    __sync_lock_release(&m->is_locked);
++}
++
++int thread_holding_mutex(struct thread_mutex *m) {
++    return (m->is_locked && m->owner_pid == getpid());
++}
++
++int main(int argc, char *argv[]) {
++    struct balance b1 = {"b1", 3200};
++    struct balance b2 = {"b2", 2800};
++
++    void *s1, *s2;
++    int thread1, thread2, r1, r2;
++
++    s1 = malloc(4096); // 4096 is the PGSIZE defined in kernel/riscv.h
++    s2 = malloc(4096);
++
++    thread_spin_init(&out_lock, "print_lock");
++    thread_spin_init(&lock, "balance_lock");
++
++    thread1 = thread_create(do_work, (void*)&b1, s1);
++    thread2 = thread_create(do_work, (void*)&b2, s2);
++
++    r1 = thread_join(thread1);
++    r2 = thread_join(thread2);
++
++    printf("Threads finished: (%d):%d, (%d):%d, shared balance:%d\n",
++        thread1, r1, thread2, r2, total_balance);
++
++    exit(0);
++}
+diff --git a/user/user.h b/user/user.h
+index 04013ca..24d5d9c 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -22,6 +22,9 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int thread_create(void(*fcn)(void*), void *arg, void*stack); 
++int thread_join(int thread_id); 
++void thread_exit(void); 
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..d79006d 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,6 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("thread_create");
++entry("thread_join");
++entry("thread_exit")
+\ No newline at end of file
